@@ -130,17 +130,14 @@ def _gmm(
         k_i = pl.program_id(2)        
 
         start_m, start_k, start_n = group_offsets[m_i], k_i*blk_k, n_i*blk_n
-        size_m = blk_m #group_lengths[m_i]
 
-        def mask_group(x, group_size, *, dim):
-            orig_dtype = x.dtype
-            iota = lax.broadcasted_iota(jnp.int32, (group_size, blk_k), dim)
-            x = x.astype(jnp.float32)
-            return jnp.where(iota < group_size, x, 0).astype(orig_dtype)
-
-
-
-        x = lhs_ref[pl.ds(start_m, size_m), pl.ds(start_k, blk_k)]
+        def mask_group(group_size):
+            row_ids = lax.broadcasted_iota(jnp.int32, (blk_m, blk_k), 0)  # rows 0..15 across all cols
+            mask2d  = row_ids < group_size
+            return mask2d
+        
+        #x = lhs_ref[pl.ds(start_m, blk_m), pl.ds(start_k, blk_k)]
+        x = pl.load(lhs_ref, (pl.ds(start_m, blk_m), pl.ds(start_k, blk_k)), mask=mask_group(group_lengths[m_i]) )
         y = rhs_ref[pl.ds(start_k, blk_k), pl.ds(start_n, blk_n)]
         
         dot_general_dims = (((1,), (1,)), ((), ())) if transpose_rhs else (((1,), (0,)), ((), ()))
@@ -152,7 +149,7 @@ def _gmm(
                                         dimension_numbers=dot_general_dims,
                                     )
 
-        pl.atomic_add(out_ref, (pl.ds(start_m, size_m), pl.ds(start_n, blk_n)) , block_result )
+        pl.atomic_add(out_ref, (pl.ds(start_m, blk_m), pl.ds(start_n, blk_n)) , block_result, mask=mask_group(group_lengths[m_i]) )
 
     call_pallas_gmm_kernel = pl.pallas_call(
                               group_gmm_kernel,
@@ -164,12 +161,12 @@ def _gmm(
     return call_pallas_gmm_kernel(lhs, rhs, group_offsets, group_lengths)
 
 def main():
-
+  
     M, K , N = 64, 256, 512
     lhs = jnp.full((M, K), 3.0, dtype=jnp.float32)
     rhs = jnp.full((K, N), 2.0, dtype=jnp.float32)
 
-    group_sizes = jnp.array([16, 16, 32], dtype=jnp.int32)
+    group_sizes = jnp.array([3, 4, 6, 8, 11, 32], dtype=jnp.int32)
     
     pallas_out = gmm(lhs, rhs,  group_sizes, blk_m=16, blk_k=16,blk_n=16, interpret=False)
     pallas_out.block_until_ready()
