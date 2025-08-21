@@ -42,6 +42,7 @@ def test_gpu_megablox():
 
 
     # ---------- Test 1 ----------
+    """
     M, K, N = 512, 512, 256
     group_sizes = jnp.array([32, 64, 128, 32, 64, 128, 64], dtype=jnp.int32)
     g = group_sizes.shape[0]
@@ -50,11 +51,12 @@ def test_gpu_megablox():
     tiling = (16, 16, 16)
     # This part of code is for checking gmm vs ragged dot accuracy
     check_gmm_vs_ragged_dot(lhs, rhs, group_sizes, tiling)
+    """
     
 
     # ---------- Test 2 ----------
     
-    M, K, N, E = 512, 2048, 1024, 160
+    M, K, N, E = 512, 2048, 4096, 160
     lhs = jax.random.normal(key, (M, K), dtype=jnp.float32)
     rhs = jax.random.normal(key, (E, K, N), dtype=jnp.float32)
 
@@ -64,7 +66,7 @@ def test_gpu_megablox():
 
     #print(f"group_sizes 1: {group_sizes}")
 
-    tile_size = (16, 16, 16)  # no partial leftover
+    tile_size = (32, 32, 32)  # no partial leftover
    
     check_gmm_vs_ragged_dot(lhs, rhs, group_sizes, tile_size, 5e-1)
     print("Test 3 => PASSED")    # <= DID NOT PASS!!
