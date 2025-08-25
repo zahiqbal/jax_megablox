@@ -1,17 +1,21 @@
 
 import jax
 import jax.numpy as jnp
-import megablox_new.gmm as mblx_atomic_add
-import megablox.gmm as mblx_reduction_dim_loop
-from megablox.gmm import tgmm as tgmm_loop
 
+import megablox_atomic.gmm as mblx_atomic_add
+import megablox.gmm as mblx_reduction_dim_loop
+from megablox.gmm import gmm as mblx_reduction_dim_loop_gmm
+import megablox_jt.gmm_jt as mblx_jt
+
+import jt_kernel.gmm as jt_kernel  # adjust import to wherever you've defined gmm
+from jt_kernel.gmm import gmm as jt_gmm
+
+#from megablox.gmm import tgmm as tgmm
 
 import functools
 import timeit
 
-
-
-TILING: tuple[int, int, int] = (64, 64, 64)
+TILING: tuple[int, int, int] = (16, 16, 16)
 # Default transposition.
 TRANS_LHS: bool = False
 TRANS_RHS: bool = False
@@ -55,7 +59,7 @@ def _perf_(func_, ntrials, m, k, n, str ):
 
 def main(unused_argv):
    
-    preferred_element_type=jnp.bfloat16 #jnp.float32
+    preferred_element_type=jnp.float32
     precision_ = "F32_F32_F32" if preferred_element_type==jnp.float32 else "BF16_BF16_F32"
     print(f"precision_ = {precision_}")
     
@@ -68,20 +72,26 @@ def main(unused_argv):
     
     print(f"lhs shape={lhs.shape}, rhs shape={rhs.shape}, group_sizes={group_sizes} preferred_element_type={preferred_element_type}")
 
-    #mblx_atomic_add_gmm = functools.partial(mblx_atomic_add.gmm, lhs, rhs, group_sizes=group_sizes, tiling=TILING, interpret=False)
-    #mblx_reduction_loop = functools.partial(mblx_reduction_dim_loop.gmm, lhs, rhs, group_sizes=group_sizes, tiling=TILING, interpret=False)
+    mblx_atomic_add_gmm = functools.partial(mblx_atomic_add.gmm, lhs, rhs, group_sizes=group_sizes, preferred_element_type=preferred_element_type,tiling=TILING, interpret=False)
+    mblx_reduction_loop = functools.partial(mblx_reduction_dim_loop_gmm, lhs, rhs, group_sizes=group_sizes, preferred_element_type=preferred_element_type, tiling=TILING, interpret=False)
+    mblx_jt_func = functools.partial(mblx_jt.gmm, lhs, rhs, group_sizes=group_sizes, preferred_element_type=preferred_element_type, tiling=TILING, interpret=False)
     #jax_ragged_dot = functools.partial(jax.lax.ragged_dot, lhs, rhs, group_sizes=group_sizes,precision=precision_, )
+    jax_trioton_func = functools.partial(jt_kernel.gmm, lhs, rhs, group_sizes, TILING, preferred_element_type, False,)
     
     #mblx_atomic_add_tgmm = functools.partial(mblx_atomic_add.tgmm, lhs, rhs, group_sizes=group_sizes, tiling=TILING, interpret=False)
-    mblx_reduction_loop_tgmm = functools.partial(tgmm_loop, lhs, rhs[0], group_sizes=group_sizes, tiling=TILING, interpret=False) 
+    #mblx_reduction_loop_tgmm = functools.partial(tgmm_loop, lhs, rhs[0], group_sizes=group_sizes, tiling=TILING, interpret=False) 
     
     
     ntrials=5
-    #_perf_(mblx_atomic_add_gmm, ntrials, M, K, N, "megablox-gmm-atomic_add")
-    #_perf_(mblx_reduction_loop, ntrials, M, K, N, "megablox-gmm-reduction-index-loop")
+    
+    _perf_(mblx_atomic_add_gmm, ntrials, M, K, N, "megablox-gmm-atomic_add")
+    _perf_(mblx_reduction_loop, ntrials, M, K, N, "megablox-gmm-reduction-index-loop")
+    _perf_(jax_trioton_func, ntrials, M, K, N, "jax-triton-gmm")
+    _perf_(mblx_jt_func, ntrials, M, K, N, "megablox-jt-gmm")
+    
     #_perf_(jax_ragged_dot, ntrials, M, K, N, "ragged_dot")
     #_perf_(mblx_atomic_add_tgmm, ntrials, M, K, N, "megablox-tgmm-atomic_add")
-    _perf_(mblx_reduction_loop_tgmm, ntrials, M, K, N, "megablox-gmm-reduction-dimloop")
+    #_perf_(mblx_reduction_loop_tgmm, ntrials, M, K, N, "megablox-gmm-reduction-dimloop")
   
     
 if __name__ == "__main__":
