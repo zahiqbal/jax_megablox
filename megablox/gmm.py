@@ -21,9 +21,10 @@ from typing import Any, Optional
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
-#from jax.experimental.pallas.ops.gpu.megablox import common
 from megablox import common
 import jax.numpy as jnp
+
+from jax._src.lax.control_flow.for_loop import for_loop
 
 
 partial = functools.partial
@@ -35,7 +36,7 @@ def _validate_args(
     rhs: jnp.ndarray,
     group_sizes: jnp.ndarray,
     expected_rhs_dims: int = 3,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.dtype]:
+):
   """Validates the arguments for the gmm function."""
   # Validate 'lhs'.
   if lhs.ndim != 2:
@@ -57,9 +58,6 @@ def _validate_args(
     )
 
 
-def num_tiles(size, blk_size):
-    return 1 if blk_size<=0 else (size+blk_size-1)//blk_size
-
 def _calculate_num_tiles(x: int, tx: int) -> int:
   tiles, rem = divmod(x, tx)
   if rem:
@@ -80,26 +78,180 @@ GroupMetadata = Any  # TODO(enriqueps): Clean this up and use a namedtuple
 def make_group_metadata(
     *,
     group_sizes: jnp.ndarray,
-    m: jnp.int32,
-    block: jnp.int32
+    m: int,
+    tm: int,
+    start_group: jnp.ndarray,
+    num_nonzero_groups: int,
+    visit_empty_groups: bool = True,
 ) -> GroupMetadata:
-   
-    print(f"group_sizes={group_sizes}, shape={group_sizes.shape}")
-    split_sizes = []
-    for size in group_sizes:
-        while size > block:
-            split_sizes.append(block)
-            size -= block
-        split_sizes.append(size)
+  """Create the metadata needed for grouped matmul computation.
 
-    # 2) cumulative ends = where every tile finishes
-    group_lengths = jnp.array(split_sizes, dtype=jnp.int32)
-    group_ends=jnp.cumsum(group_lengths).astype(jnp.int32)
-    group_offsets = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), group_ends]).astype(jnp.int32)
-    print(f"group_offsets={group_offsets}, shape={group_offsets.shape}")
-    print(f"group_lengths={group_lengths}, shape={group_lengths.shape}")
+  Args:
+    group_sizes: A 1d, jnp.ndarray with shape [num_groups] and jnp.int32 dtype.
+    m: The number of rows in lhs.
+    tm: The m-dimension tile size being used.
+    start_group: The group in group sizes to start computing from. This is
+      particularly useful for when rhs num_groups is sharded.
+    num_nonzero_groups: Number of groups in group sizes to compute on. Useful in
+      combination with group_offset.
+    visit_empty_groups: If True, do not squeeze tiles for empty groups out of
+      the metadata. This is necessary for tgmm, where we at least need to zero
+      the output for each group.
 
-    return group_offsets, group_lengths, group_offsets.shape[0]
+  Returns:
+    tuple of:
+      group_offsets: A 1d, jnp.ndarray with shape [num_groups+1] and jnp.int32
+        dtype. group_offsets[i] indicates the row at which group [i] starts in
+        the lhs matrix and group_offsets[i-1] = m.
+      group_ids: A 1d, jnp.ndarray with shape [m_tiles + num_groups] and
+        jnp.int32 dtype. group_ids[i] indicates which group grid index 'i' will
+        work on.
+      m_tile_ids: A 1d, jnp.ndarray with shape [m_tiles + num_groups] and
+        jnp.int32. m_tile_ids[i] indicates which m-dimension tile grid index 'i'
+        will work on.
+    num_tiles: The number of m-dimension tiles to execute.
+  """
+  num_groups = group_sizes.shape[0]
+  end_group = start_group + num_nonzero_groups - 1
+
+  # Calculate the offset of each group, starting at zero. This metadata is
+  # similar to row offsets in a CSR matrix. The following properties hold:
+  #
+  # group_offsets.shape = [num_groups + 1]
+  # group_offsets[0] = 0
+  # group_offsets[num_groups] = m
+  #
+  # The row at which group 'i' starts is group_offsets[i].
+  group_ends = jnp.cumsum(group_sizes)
+  group_offsets = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), group_ends])
+
+  # Assign a group id to each grid index.
+  #
+  # If a group starts somewhere other than the start of a tile or ends somewhere
+  # other than the end of a tile we need to compute that full tile. Calculate
+  # the number of tiles for each group by rounding their end up to the nearest
+  # 'tm' and their start down to the nearest 'tm'.
+
+  # (1) Round the group_ends up to the nearest multiple of 'tm'.
+  #
+  # NOTE: This does not change group_offsets[num_groups], which is m
+  # (because we enforce m is divisible by tm).
+  rounded_group_ends = ((group_ends + tm - 1) // tm * tm).astype(jnp.int32)
+
+  # (2) Round the group_starts down to the nearest multiple of 'tm'.
+  group_starts = jnp.concatenate(
+      [jnp.zeros(1, dtype=jnp.int32), group_ends[:-1]]
+  )
+  rounded_group_starts = group_starts // tm * tm
+
+  # (3) Calculate the number of rows in each group.
+  #
+  # NOTE: Handle zero-sized groups as a special case. If the start for a
+  # zero-sized group is not divisible by 'tm' its start will be rounded down and
+  # its end will be rounded up such that its size will become 1 tile here.
+  rounded_group_sizes = rounded_group_ends - rounded_group_starts
+  rounded_group_sizes = jnp.where(group_sizes == 0, 0, rounded_group_sizes)
+
+  # (4) Convert the group sizes from units of rows to unit of 'tm' sized tiles.
+  #
+  # An m-dimension tile is 'owned' by group 'i' if the first row of the tile
+  # belongs to group 'i'. In addition to owned tiles, each group can have 0 or 1
+  # initial partial tiles if it's first row does not occur in the first row of a
+  # tile. The '0-th' group never has a partial tile because it always starts at
+  # the 0-th row.
+  #
+  # If no group has a partial tile, the total number of tiles is equal to
+  # 'm // tm'. If every group has a partial except the 0-th group, the total
+  # number of tiles is equal to 'm // tm + num_groups - 1'. Thus we know that
+  #
+  # tiles_m <= group_tiles.sum() <= tiles_m + num_groups - 1
+  #
+  # Where tiles_m = m // tm.
+  #
+  # NOTE: All group sizes are divisible by 'tm' because of the rounding in steps
+  # (1) and (2) so this division is exact.
+  group_tiles = rounded_group_sizes // tm
+
+  if visit_empty_groups:
+    # Insert one tile for empty groups.
+    group_tiles = jnp.where(group_sizes == 0, 1, group_tiles)
+
+  # Create the group ids for each grid index based on the tile counts for each
+  # group.
+  #
+  # NOTE: This repeat(...) will pad group_ids with the final group id if
+  # group_tiles.sum() < tiles_m + num_groups - 1. The kernel grid will be sized
+  # such that we only execute the necessary number of tiles.
+  tiles_m = _calculate_num_tiles(m, tm)
+  group_ids = jnp.repeat(
+      jnp.arange(num_groups, dtype=jnp.int32),
+      group_tiles,
+      total_repeat_length=tiles_m + num_groups - 1,
+  )
+
+  # Assign an m-dimension tile id to each grid index.
+  #
+  # NOTE: Output tiles can only be re-visited consecutively. The following
+  # procedure guarantees that m-dimension tile indices respect this.
+
+  # (1) Calculate how many times each m-dimension tile will be visited.
+  #
+  # Each tile is guaranteed to be visited once by the group that owns the tile.
+  # The remaining possible visits occur when a group starts inside of a tile at
+  # a position other than the first row. We can calculate which m-dimension tile
+  # each group starts in by floor-dividing its offset with `tm` and then count
+  # tile visits with a histogram.
+  #
+  # To avoid double counting tile visits from the group that owns the tile,
+  # filter these out by assigning their tile id to `tile_m` (one beyond the max)
+  # such that they're ignored by the subsequent histogram. Also filter out any
+  # group which is empty.
+  #
+  # TODO(tgale): Invert the 'partial_tile_mask' predicates to be more clear.
+  partial_tile_mask = jnp.logical_or(
+      (group_offsets[:-1] % tm) == 0, group_sizes == 0
+  )
+
+  # Explicitly enable tiles for zero sized groups, if specified. This covers
+  # zero sized groups that start on a tile-aligned row and those that do not.
+  if visit_empty_groups:
+    partial_tile_mask = jnp.where(group_sizes == 0, 0, partial_tile_mask)
+
+  partial_tile_ids = jnp.where(
+      partial_tile_mask, tiles_m, group_offsets[:-1] // tm
+  )
+
+  tile_visits = (
+      jnp.histogram(partial_tile_ids, bins=tiles_m, range=(0, tiles_m - 1))[0]
+      + 1
+  )
+
+  # Create the m-dimension tile ids for each grid index based on the visit
+  # counts for each tile.
+  m_tile_ids = jnp.repeat(
+      jnp.arange(tiles_m, dtype=jnp.int32),
+      tile_visits.astype(jnp.int32),
+      total_repeat_length=tiles_m + num_groups - 1,
+  )
+
+  # Account for sharding.
+  #
+  # Find the start of the groups owned by our shard and shift the group_ids and
+  # m_tile_ids s.t. the metadata for our tiles are at the front of the arrays.
+  #
+  # TODO(tgale): Move this offset into the kernel to avoid these rolls.
+  first_tile_in_shard = (group_ids < start_group).sum()
+  group_ids = jnp.roll(group_ids, shift=-first_tile_in_shard, axis=0)
+  m_tile_ids = jnp.roll(m_tile_ids, shift=-first_tile_in_shard, axis=0)
+
+  # Calculate the number of tiles we need to compute for our shard.
+  #
+  # Remove tile visits that belong to a group not in our shard.
+  iota = jnp.arange(num_groups, dtype=jnp.int32)
+  active_group_mask = jnp.logical_and(iota <= end_group, iota >= start_group)
+  group_tiles = jnp.where(active_group_mask, group_tiles, 0)
+  num_tiles = group_tiles.sum()
+  return (group_offsets, group_ids, m_tile_ids), num_tiles
 
 
 def _get_group_size(
@@ -113,20 +265,20 @@ def _get_group_size(
   return group_end - group_start
 
 
-def _get_store_mask(
+def _get_mask(
     *,
     grid_id: jnp.ndarray,
     group_metadata: GroupMetadata,
-    tm: int,
-    tn: int,
+    t1: int,
+    t2: int,
 ) -> jnp.ndarray:
   """Mask for rows that belong to the current group in the current tile."""
   group_offsets, group_ids, m_tile_ids = group_metadata[:3]
   group_id = group_ids[grid_id]
   group_start = group_offsets[group_id]
   group_end = group_offsets[group_id + 1]
-  m_id = m_tile_ids[grid_id] * tm
-  iota = jax.lax.broadcasted_iota(jnp.int32, (tm, tn), 0) + m_id
+  m_id = m_tile_ids[grid_id] * t1
+  iota = jax.lax.broadcasted_iota(jnp.int32, (t1, t2), 0) + m_id
   return jnp.logical_and(iota >= group_start, iota < group_end)
 
 
@@ -148,115 +300,94 @@ def _zero_uninitialized_memory(
 
 LutFn = Callable[[int, int, int], Optional[tuple[int, int, int]]]
 
-def _align_dims_to_blocks(size, blk_size):
-  return pl.cdiv(size, blk_size)*blk_size - size
-
-@functools.partial(jax.jit, static_argnames=['blk_r', 'blk_c', 'pad_val', ])
-def padding2D(A, *, blk_r: jnp.int32=16 , blk_c: jnp.int32=16, pad_val: jnp.int32=0):
-    rows, cols = A.shape  
-    pad_top, pad_left = 0, 0
-    pad_bottom, pad_right = _align_dims_to_blocks(rows, blk_r), _align_dims_to_blocks(cols, blk_c)
-    return jnp.pad(A, ((pad_top, pad_bottom), (pad_left, pad_right)), mode="constant", constant_values=pad_val )
-
-@functools.partial(jax.jit, static_argnames=['blk_r', 'blk_c', 'pad_val', ])
-def padding3D(A, *, blk_r: jnp.int32=16 , blk_c: jnp.int32=16, pad_val: jnp.int32=0):
-    g, rows, cols = A.shape  
-    pad_top, pad_left = 0, 0
-    pad_bottom, pad_right = _align_dims_to_blocks(rows, blk_r), _align_dims_to_blocks(cols, blk_c)
-    return jnp.pad(A, ((0,0),(pad_top, pad_bottom), (pad_left, pad_right)), mode="constant", constant_values=pad_val )
 
 def gmm(
-      lhs: jnp.ndarray,
-      rhs: jnp.ndarray,
-      group_sizes: jnp.ndarray,
-      preferred_element_type: jnp.dtype = jnp.float32,
-      tiling: tuple[int, int, int] | LutFn | None = (32, 32, 32),
-      group_offset: jnp.ndarray | None = None,
-      existing_out: jnp.ndarray | None = None,
-      transpose_rhs: bool = False,
-      interpret: bool = False,
-    ) -> jnp.ndarray:
+    lhs: jnp.ndarray,
+    rhs: jnp.ndarray,
+    group_sizes: jnp.ndarray,
+    preferred_element_type: jnp.dtype = jnp.float32,
+    tiling: tuple[int, int, int] | LutFn | None = (64, 64, 64),
+    group_offset: jnp.ndarray | None = None,
+    existing_out: jnp.ndarray | None = None,
+    transpose_rhs: bool = False,
+    interpret: bool = False,
+) -> jnp.ndarray:
+  """Compute lhs[sizes[i-1]:sizes[i], :] @ rhs for each group 'i'.
 
-    """Compute lhs[sizes[i-1]:sizes[i], :] @ rhs for each group 'i'.
+  Args:
+    lhs: A 2d, jnp.ndarray with shape [m, k].
+    rhs: A 3d, jnp.ndarray with shape [num_groups, k, n].
+    group_sizes: A 1d, jnp.ndarray with shape [num_groups] and jnp.int32 dtype.
+    preferred_element_type: jnp.dtype, the element type for the output matrix.
+    tiling: 3-tuple of ints. The m, k and n-dimension tile sizes.
+    group_offset: The group in group sizes to start computing from. This is
+      particularly useful for when rhs num_groups is sharded.
+    existing_out: Existing output to write to.
+    transpose_rhs: True if the rhs needs to be transposed.
+    interpret: Whether or not to run the kernel in interpret mode, helpful for
+      testing and debugging.
 
-    Args:
-      lhs: A 2d, jnp.ndarray with shape [m, k].
-      rhs: A 3d, jnp.ndarray with shape [num_groups, k, n].
-      group_sizes: A 1d, jnp.ndarray with shape [num_groups] and jnp.int32 dtype.
-      preferred_element_type: jnp.dtype, the element type for the output matrix.
-      tiling: 3-tuple of ints. The m, k and n-dimension tile sizes.
-      group_offset: The group in group sizes to start computing from. This is
-        particularly useful for when rhs num_groups is sharded.
-      existing_out: Existing output to write to.
-      transpose_rhs: True if the rhs needs to be transposed.
-      interpret: Whether or not to run the kernel in interpret mode, helpful for
-        testing and debugging.
+  Returns:
+    A 2d, jnp.ndarray with shape [m, n].
+  """
+  _validate_args(lhs=lhs, rhs=rhs, group_sizes=group_sizes)
+  m, k = lhs.shape
+  g, k1, n =  rhs.shape
+  k1, n = (n, k1) if transpose_rhs else (k1, n)
+  assert k == k1, f"k dimensions are not the same: {k} vs {k1}"
+  assert g == group_sizes.shape[0], f"rhs and groups sizes dim mismatch  : {g} vs {group_sizes.shape[0]}"
+  
+  if group_offset is None:
+    group_offset = jnp.array([0], dtype=jnp.int32)
+  else:
+    if group_offset.shape:
+      raise ValueError(
+          f"group_offset must be a ()-shaped array. Got: {group_offset.shape}."
+      )
+    group_offset = group_offset[None]
 
-    Returns:
-      A 2d, jnp.ndarray with shape [m, n].
-    """
+  # If tiling is callable, look up the problem dimensions in the LUT. If no tuned
+  # tile dimensions are available throw an error.
+  if callable(tiling):
+    tiling = tiling(m, k, n)
 
-    _validate_args(lhs=lhs, rhs=rhs, group_sizes=group_sizes)
+  if tiling is None:
+    raise ValueError(f"No tuned tiling found for (m, k, n) = ({m}, {k}, {n})")
 
-    m, k = lhs.shape
-    g, k1, n =  rhs.shape
-    k1, n = (n, k1) if transpose_rhs else (k1, n)
-    assert k == k1, f"k dimensions are not the same: {k} vs {k1}"
-    assert g == group_sizes.shape[0], f"rhs and groups sizes dim mismatch  : {g} vs {group_sizes.shape[0]}"
+  # Create the metadata we need for computation.
+  group_metadata, num_active_tiles = make_group_metadata(  # pylint: disable=unbalanced-tuple-unpacking
+      group_sizes=group_sizes,
+      m=lhs.shape[0],
+      tm=tiling[0],
+      start_group=group_offset[0],
+      num_nonzero_groups=rhs.shape[0],
+      visit_empty_groups=False,
+  )
 
+  #print(f"group_metadata: (group_offsets, group_ids, m_tile_ids) = {group_metadata}")
+  #maskkk=_get_mask(grid_id=1, group_metadata=group_metadata, t1=16,t2=16)
+  #print(f"mask={maskkk}")
 
-    # If tiling is callable, look up the problem dimensions in the LUT. If no tuned
-    # tile dimensions are available throw an error.
-    if callable(tiling):
-      tiling = tiling(m, k, n)
-
-    if tiling is None:
-      raise ValueError(f"No tuned tiling found for (m, k, n) = ({m}, {k}, {n})")
-
-    tm, tk, tn = tiling
-      
-    # Create the metadata we need for computation.
-    group_offsets, group_lengths, num_groups = make_group_metadata( group_sizes=group_sizes,
-                                                                    m=lhs.shape[0],
-                                                                    block=tm
-                                                                  )
-
-    blk_m, blk_k, blk_n = tiling
-
-    
-    print(f"Before padding:  lhs shape = {lhs.shape}, rhs shape = {rhs.shape}")
-
-    lhs=padding2D(lhs, blk_r=blk_m , blk_c=blk_k, pad_val=0)
-    
-    for g_i in jnp.arange(g):
-      if transpose_rhs:
-        rhs=padding3D(rhs, blk_r=blk_n , blk_c=blk_k, pad_val=0) 
-      else:
-        rhs=padding3D(rhs, blk_r=blk_k , blk_c=blk_n, pad_val=0)
-
-    print(f"After padding:  lhs shape = {lhs.shape}, rhs shape = {rhs.shape}")
-
-    output = _gmm(
-                  lhs,
-                  rhs,
-                  group_sizes,
-                  group_offsets,
-                  group_lengths,
-                  number_of_groups=num_groups,
-                  preferred_element_type=preferred_element_type,
-                  tiling=tiling,
-                  group_offset=group_offset,
-                  existing_out=existing_out,
-                  transpose_rhs=transpose_rhs,
-                  interpret=interpret,
-                )
-    return output[:m, :n]
+  return _gmm(
+                lhs=lhs,
+                rhs=rhs,
+                group_metadata=group_metadata,
+                num_total_groups=group_sizes.shape[0],
+                num_active_tiles=num_active_tiles.item(),
+                preferred_element_type=preferred_element_type,
+                tiling=tiling,
+                group_offset=group_offset,
+                existing_out=existing_out,
+                transpose_rhs=transpose_rhs,
+                interpret=interpret,
+              )
 
 
 @functools.partial(
     jax.jit,
     static_argnames=[
-        "number_of_groups",
+        "num_total_groups",
+        "num_active_tiles",
         "preferred_element_type",
         "tiling",
         "transpose_rhs",
@@ -264,20 +395,36 @@ def gmm(
     ],
 )
 def _gmm(
-    lhs: jnp.ndarray,
-    rhs: jnp.ndarray,
-    group_sizes: jnp.ndarray, 
-    group_offsets: jnp.ndarray,
-    group_lengths: jnp.ndarray,
-    number_of_groups: int,
-    preferred_element_type: jnp.dtype,
-    tiling: tuple[int, int, int],
-    group_offset: jnp.ndarray,
-    existing_out: jnp.ndarray,
-    transpose_rhs: bool,
-    interpret: bool,
+          lhs: jnp.ndarray,
+          rhs: jnp.ndarray,
+          group_metadata: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+          num_total_groups: int,
+          num_active_tiles: int,
+          preferred_element_type: jnp.dtype = jnp.float32,
+          tiling: tuple[int, int, int] | LutFn | None = (32, 32, 32),
+          group_offset: jnp.ndarray | None = None,
+          existing_out: jnp.ndarray | None = None,
+          transpose_rhs: bool = False,
+          interpret: bool = False,
 ) -> jnp.ndarray:
-  
+  """Compute lhs[sizes[i-1]:sizes[i], :] @ rhs for each group 'i'.
+
+  Args:
+    lhs: A 2d, jnp.ndarray with shape [m, k].
+    rhs: A 3d, jnp.ndarray with shape [num_groups, k, n].
+    group_sizes: A 1d, jnp.ndarray with shape [num_groups] and jnp.int32 dtype.
+    preferred_element_type: jnp.dtype, the element type for the output matrix.
+    tiling: 3-tuple of ints. The m, k and n-dimension tile sizes.
+    group_offset: The group in group sizes to start computing from. This is
+      particularly useful for when rhs num_groups is sharded.
+    existing_out: Existing output to write to.
+    transpose_rhs: True if the rhs needs to be transposed.
+    interpret: Whether or not to run the kernel in interpret mode, helpful for
+      testing and debugging.
+
+  Returns:
+    A 2d, jnp.ndarray with shape [m, n].
+  """
 
   if existing_out is not None:
     assert isinstance(existing_out, jax.Array)
@@ -287,86 +434,122 @@ def _gmm(
           "Existing output dtype must match preferred_element_type."
       )
 
-  if group_offset is None:
-      group_offset = jnp.array([0], dtype=jnp.int32)
-  else:
-    if group_offset.shape:
-      raise ValueError(
-          f"group_offset must be a ()-shaped array. Got: {group_offset.shape}."
-      )
-    group_offset = group_offset[None]
-  
-  m, k = lhs.shape
-  g, k1, n =  rhs.shape
-  #k1, n =  rhs.shape
-  
+  num_current_groups = rhs.shape[0]
   input_dtype = common.select_input_dtype(lhs, rhs)
-  blk_m, blk_k, blk_n = tiling
 
-  tile_m = num_tiles(m, blk_m)
-  tile_k = num_tiles(k, blk_k)
-  tile_n = num_tiles(n, blk_n)
+  
+  # Gather shape information.
+  m, k, n = (lhs.shape[0], lhs.shape[1], rhs.shape[2])
+  if transpose_rhs:
+    n = rhs.shape[1]
 
-  # kernel function
+  tm, tk, tn = tiling
+  tiles_k, k_rem = _calculate_irregular_num_tiles(k, tk)
+  tiles_n, n_rem = _calculate_irregular_num_tiles(n, tn)
+  del n_rem
+
+  
   def kernel(
-        lhs_ref,
-        rhs_ref,
-        group_offsets,
-        group_lengths,
-        out_ref,
-  ) -> jnp.ndarray:
+      group_metadata,
+      group_offset,
+      lhs,
+      rhs,
+      existing_out,
+      out,
+  ):
+    group_offsets, group_ids, m_tile_ids = group_metadata
+    #del group_offsets, group_ids, group_offset
+
+    n_i     = pl.program_id(0)
+    grid_id = pl.program_id(1)
+
+    def _existing_out():
+
+      if existing_out is not None:
+        prev_grid_id = jnp.where(grid_id > 0, grid_id - 1, 0)
+        is_first_processed_group = grid_id == 0
+        m_tile_changed = m_tile_ids[grid_id] != m_tile_ids[prev_grid_id]
+        first_time_seeing_out = jnp.logical_or(
+            is_first_processed_group, m_tile_changed
+        )
+
+        @pl.when(first_time_seeing_out)
+        def _init_out():
+          block_out = pl.load(existing_out,  (pl.ds(m_tile_ids[grid_id]*tm, tm), pl.ds(n_i*tn, tn)))
+          pl.store(out, (pl.ds(m_tile_ids[grid_id]*tm, tm), pl.ds(n_i*tn, tn)) , block_out )
+          
+
+    _existing_out()
+    acc = jnp.zeros( (tm, tn), dtype=jnp.float32)
+
+    def _matmul_acc(kk, acc_ref):
+      if transpose_rhs:
+        dot_general_dims = (((1,), (1,)), ((), ()))
+      else:
+        dot_general_dims = (((1,), (0,)), ((), ()))
+
+      _lhs_grp_mask_ = _get_mask(grid_id=grid_id,
+                                group_metadata=group_metadata,
+                                t1=tm,
+                                t2=tk,)
+
+
+      loaded_lhs = pl.load(lhs, (pl.ds(m_tile_ids[grid_id]*tm, tm), pl.ds(kk * tk, tk)))
+
+      g_index = (group_ids[grid_id]-group_offset[0])
+      if transpose_rhs:
+        loaded_rhs = pl.load(rhs, (g_index, pl.ds(n_i*tn, tn), pl.ds(kk * tk, tk))  )
+      else:
+        loaded_rhs = pl.load(rhs, (g_index, pl.ds(kk * tk, tk), pl.ds(n_i*tn, tn))  )
       
-      # initialize out_ref to 0: Note: initialization out_ref to 0 generates incorrect results          
-      #@pl.when((m_i==0) & (n_i==0) & (k_i==0))
-      #def _():
-      #  out_ref[...] = jnp.zeros_like(out_ref)  
-      
-      n_i = pl.program_id(0)
-      m_i = pl.program_id(1)
-      k_i = pl.program_id(2)        
+      acc_ref[:,:] += lax.dot_general(
+          loaded_lhs.astype(input_dtype),
+          loaded_rhs.astype(input_dtype),
+          preferred_element_type=jnp.float32,
+          dimension_numbers=dot_general_dims,
+      )
 
-      start_m, start_k, start_n = group_offsets[m_i], k_i*blk_k, n_i*blk_n
-     
-      def mask_group(group_size):
-          row_ids = lax.broadcasted_iota(jnp.int32, (blk_m, blk_k), 0)  # rows 0..15 across all cols
-          mask2d  = row_ids < group_size
-          return mask2d
-      
-      #x = lhs_ref[pl.ds(start_m, size_m), pl.ds(start_k, blk_k)]
-      x = pl.load(lhs_ref, (pl.ds(start_m, blk_m), pl.ds(start_k, blk_k)), mask=mask_group(group_lengths[m_i]) )
-      y = rhs_ref[pl.ds(start_k, blk_k), pl.ds(start_n, blk_n)]
-      
-      dot_general_dims = (((1,), (1,)), ((), ())) if transpose_rhs else (((1,), (0,)), ((), ()))
-              
-      block_result = lax.dot_general(
-                                      x.astype(x.dtype),
-                                      y.astype(y.dtype),
-                                      preferred_element_type=jnp.float32,
-                                      dimension_numbers=dot_general_dims,
-                                  )
+    acc = for_loop(tiles_k, _matmul_acc, acc).astype(out.dtype)
 
-      pl.atomic_add(out_ref, (pl.ds(start_m, blk_m), pl.ds(start_n, blk_n)) , block_result, mask=mask_group(group_lengths[m_i]) )
+    _store_mask_ =  _get_mask( grid_id=grid_id,
+                                group_metadata=group_metadata,
+                                t1=tm,
+                                t2=tn,)
 
-  call_pallas_gmm_kernel = pl.pallas_call(
-                            kernel,
-                            out_shape=jax.ShapeDtypeStruct((m ,n), lhs.dtype),
-                            grid=(tile_n, number_of_groups, tile_k),
-                            interpret=interpret,
-                            debug=False,  
-                          )
-  return call_pallas_gmm_kernel(lhs, rhs[0], group_offsets, group_lengths)
+    pl.store(out, (pl.ds(m_tile_ids[grid_id]*tm, tm), pl.ds(n_i*tn, tn)) , acc, mask=_store_mask_ )
 
-'''
 
-@functools.partial(
-    jax.jit,
-    static_argnames=[
-        "preferred_element_type",
-        "tiling",
-        "num_actual_groups",
-        "interpret",
-    ],
-)
+  if existing_out is None:
+    input_output_aliases = {}
+  else:
+    input_output_aliases = {6: 0}
+
+  call_gmm = pl.pallas_call(
+      kernel,
+      out_shape=jax.ShapeDtypeStruct((m, n), preferred_element_type),
+      grid=(tiles_n, num_active_tiles),
+      interpret=interpret,
+  )
+
+  out = call_gmm(
+      group_metadata,
+      group_offset,
+      lhs,
+      rhs,
+      existing_out,
+  )
+
+  if existing_out is None and num_current_groups < num_total_groups:
+    out = _zero_uninitialized_memory(
+        out,
+        start_group=group_offset[0],
+        num_nonzero_groups=rhs.shape[0],
+        group_metadata=group_metadata,
+    )
+  return out
+
+############################################################################################################
+
 def tgmm(
     lhs: jnp.ndarray,
     rhs: jnp.ndarray,
@@ -401,16 +584,10 @@ def tgmm(
     group_offset = jnp.array([0], dtype=jnp.int32)
   else:
     group_offset = group_offset[None]
-  lhs, group_sizes, input_dtype = _validate_args(
-      lhs=lhs, rhs=rhs, group_sizes=group_sizes, expected_rhs_dims=2
-  )
 
-  # Gather shape information.
+  _validate_args(lhs=lhs, rhs=rhs, group_sizes=group_sizes, expected_rhs_dims=2)
+
   k, m, n = (lhs.shape[0], lhs.shape[1], rhs.shape[1])
-  num_groups = group_sizes.shape[0]
-  num_actual_groups = (
-      num_actual_groups if num_actual_groups is not None else num_groups
-  )
 
   # If tiling is callable, look up the problem dimensions in the LUT. If no tuned
   # tile dimensions are available throw an error.
@@ -420,11 +597,12 @@ def tgmm(
   if tiling is None:
     raise ValueError(f"No tuned tiling found for (m, k, n) = ({m}, {k}, {n})")
 
+  num_groups = group_sizes.shape[0]
+  num_actual_groups = (
+      num_actual_groups if num_actual_groups is not None else num_groups
+  )
+
   tm, tk, tn = tiling
-  tiles_k, k_rem = _calculate_irregular_num_tiles(k, tk)
-  del k_rem
-  tiles_n, n_rem = _calculate_irregular_num_tiles(n, tn)
-  del n_rem
 
   # Create the metadata we need for computation.
   group_metadata, num_active_tiles = make_group_metadata(
@@ -436,6 +614,59 @@ def tgmm(
       visit_empty_groups=True,
   )
 
+  out_ = _tgmm(
+                lhs=lhs,
+                rhs=rhs,
+                group_metadata=group_metadata,
+                num_total_groups=group_sizes.shape[0],
+                num_active_tiles=num_active_tiles.item(),
+                preferred_element_type=preferred_element_type,
+                tiling=tiling,
+                group_offset=group_offset,
+                num_actual_groups=num_actual_groups,
+                existing_out=existing_out,
+                interpret=interpret,
+              )
+
+  return out_
+
+
+@functools.partial(
+  jax.jit,
+  static_argnames=[
+      "num_total_groups",
+      "num_active_tiles",
+      "preferred_element_type",
+      "tiling",
+      "num_actual_groups",
+      "interpret",
+  ],
+)
+def _tgmm(
+  lhs: jnp.ndarray,
+  rhs: jnp.ndarray,
+  group_metadata: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+  num_total_groups: int,
+  num_active_tiles: int,
+  preferred_element_type,
+  tiling: tuple[int, int, int],
+  group_offset: jnp.ndarray,
+  num_actual_groups: int | None = None,
+  existing_out: jnp.ndarray | None = None,
+  interpret: bool = False,
+) -> jnp.ndarray:
+
+  # Gather shape information.
+  k, m, n = (lhs.shape[0], lhs.shape[1], rhs.shape[1])
+  input_dtype = common.select_input_dtype(lhs, rhs)
+
+  tm, tk, tn = tiling
+
+  tiles_k, k_rem = _calculate_irregular_num_tiles(k, tk)
+  del k_rem
+  tiles_n, n_rem = _calculate_irregular_num_tiles(n, tn)
+  del n_rem
+
   def kernel(
       group_metadata,
       group_offset,
@@ -443,141 +674,98 @@ def tgmm(
       rhs,
       existing_out,
       out,
-      acc_scratch,
   ):
-    grid_id = pl.program_id(2)
+    n_i     = pl.program_id(0)
+    k_i     = pl.program_id(1)
+    
     group_offsets, group_ids, m_tile_ids = group_metadata
-    del group_offsets, group_offset, m_tile_ids
 
-    group = group_ids[grid_id]
-    prev_grid_id = jnp.where(grid_id > 0, grid_id - 1, 0)
-    prev_group = group_ids[prev_grid_id]
+    acc = jnp.zeros( (tk, tn), dtype=jnp.float32)
 
-    group_has_changed = jnp.logical_or(grid_id == 0, prev_group != group)
+    def _matmul_tgmm(grid_id, acc_ref):
 
-    @pl.when(group_has_changed)
-    def _zero_acc():
-      acc_scratch[...] = jnp.zeros_like(acc_scratch)
 
-    # We'll only do computation if our group has a nonzero number of rows in it.
-    dont_skip = (
-        _get_group_size(grid_id=grid_id, group_metadata=group_metadata) > 0
-    )
+      group = group_ids[grid_id]
+      prev_grid_id = jnp.where(grid_id > 0, grid_id - 1, 0)
+      prev_group = group_ids[prev_grid_id]
 
-    @pl.when(dont_skip)
-    def _do():
-      rhs_mask = _get_store_mask(
-          grid_id=grid_id,
-          group_metadata=group_metadata,
-          tm=tm,
-          tn=tn,
-      )
-      lhs_mask = _get_store_mask(
-          grid_id=grid_id,
-          group_metadata=group_metadata,
-          tm=tm,
-          tn=tk,
+      group_has_changed = jnp.logical_or(grid_id == 0, prev_group != group)
+
+      @pl.when(group_has_changed)
+      def _zero_acc():
+        acc_ref[:, :] = jnp.zeros_like(acc_ref)
+
+      # We'll only do computation if our group has a nonzero number of rows in it.
+      dont_skip = (
+          _get_group_size(grid_id=grid_id, group_metadata=group_metadata) > 0
       )
 
-      loaded_lhs = lhs[...]
-      loaded_rhs = rhs[...]
-      loaded_lhs = lax.select(
-          lhs_mask[...],
-          loaded_lhs.astype(jnp.float32),
-          jnp.zeros_like(lhs, jnp.float32),
-      ).swapaxes(0, 1)
-      loaded_rhs = lax.select(
-          rhs_mask[...],
-          loaded_rhs.astype(jnp.float32),
-          jnp.zeros_like(rhs, jnp.float32),
-      )
+      @pl.when(dont_skip)
+      def _do():
+        rhs_mask = _get_mask(
+            grid_id=grid_id,
+            group_metadata=group_metadata,
+            t1=tm,
+            t2=tn,
+        )
+        lhs_mask = _get_mask(
+            grid_id=grid_id,
+            group_metadata=group_metadata,
+            t1=tm,
+            t2=tk,
+        )
+        loaded_lhs = pl.load(lhs, ( pl.ds(m_tile_ids[grid_id]*tm, tm), pl.ds(k_i*tk, tk)) )
+        loaded_rhs = pl.load(rhs, (pl.ds(m_tile_ids[grid_id]*tm, tm), pl.ds(n_i*tn, tn))  )
 
-      acc_scratch[...] += lax.dot(
-          loaded_lhs.astype(input_dtype),
-          loaded_rhs.astype(input_dtype),
-          preferred_element_type=jnp.float32,
-      )
+        loaded_lhs = lax.select(
+            lhs_mask[...],
+            loaded_lhs.astype(jnp.float32),
+            jnp.zeros_like(loaded_lhs, jnp.float32),
+        ).swapaxes(0, 1)
+        loaded_rhs = lax.select(
+            rhs_mask[...],
+            loaded_rhs.astype(jnp.float32),
+            jnp.zeros_like(loaded_rhs, jnp.float32),
+        )
+        
+        acc_ref[:,:] += lax.dot(
+            loaded_lhs.astype(input_dtype),
+            loaded_rhs.astype(input_dtype),
+            preferred_element_type=jnp.float32,
+        )       
+    
 
-    is_end_of_grid = grid_id == (pl.num_programs(2) - 1)
-    next_grid_id = jnp.where(is_end_of_grid, grid_id, grid_id + 1)
-    next_group = group_ids[next_grid_id]
+      group = group_ids[grid_id]
+      is_end_of_grid = grid_id == (num_active_tiles - 1)
+      next_grid_id = jnp.where(is_end_of_grid, grid_id, grid_id + 1)
+      next_group = group_ids[next_grid_id]
 
-    group_is_changing = jnp.logical_or(is_end_of_grid, group != next_group)
+      group_is_changing = jnp.logical_or(is_end_of_grid, group != next_group)
+      @pl.when(group_is_changing)
+      def _store_acc_tgmm():
+        g_i = (group_ids[grid_id] - group_offset[0])
+        if existing_out is not None:
+          acc_ref[:,:] += pl.load(existing_out, (g_i, pl.ds(k_i*tk, tk), pl.ds(n_i*tn, tn)) )
 
-    @pl.when(group_is_changing)
-    def _store_accum():
-      to_store = acc_scratch[...]
-      if existing_out is not None:
-        to_store += existing_out[...].astype(jnp.float32)
-      out[...] = to_store.astype(preferred_element_type)
+        pl.store(out, (g_i, pl.ds(k_i*tk, tk), pl.ds(n_i*tn, tn)), acc_ref[:,:] )
 
-  def lhs_transform_indices(n_i, k_i, grid_id, group_metadata, group_offset):
-    # lhs is (m, k). Load the [tm, tk] matrix for this m-tile.
-    group_offsets, group_ids, m_tile_ids = group_metadata
-    del n_i, group_offsets, group_ids, group_offset
-    return m_tile_ids[grid_id], k_i
+    acc = for_loop(num_active_tiles, _matmul_tgmm, acc).astype(out.dtype)
+ 
+  ### end of kernel ##########
 
-  def rhs_transform_indices(n_i, k_i, grid_id, group_metadata, group_offset):
-    # rhs is (m, n). Load the [tm, tn] matrix for this m-tile.
-    group_offsets, group_ids, m_tile_ids = group_metadata
-    del k_i, group_offsets, group_ids, group_offset
-    return m_tile_ids[grid_id], n_i
-
-  def out_transform_indices(n_i, k_i, grid_id, group_metadata, group_offset):
-    # out is (num_groups, k, n). Load the [tk, tn] matrix based on the group id
-    # for this m-tile.
-    group_offsets, group_ids, m_tile_ids = group_metadata
-    del group_offsets, m_tile_ids
-
-    # NOTE: If we're working on only a shard of the output we need to adjust the
-    # group index we load from to account for this. The group_ids are in the
-    # "unsharded" domain.
-    return group_ids[grid_id] - group_offset[0], k_i, n_i
-
-  out_block_spec = pl.BlockSpec((None, tk, tn), out_transform_indices)
   if existing_out is None:
-    in_out_block_spec: Any = None
     input_output_aliases = {}
   else:
-    in_out_block_spec = out_block_spec
     input_output_aliases = {6: 0}
 
-  lhs_block_spec = pl.BlockSpec((tm, tk), lhs_transform_indices)
-  rhs_block_spec = pl.BlockSpec((tm, tn), rhs_transform_indices)
-
-  lhs_bytes = lhs.size * lhs.itemsize
-  rhs_bytes = rhs.size * rhs.itemsize
-  out_bytewidth = jnp.dtype(preferred_element_type).itemsize
-  out_bytes = (num_actual_groups * k * n) * out_bytewidth
-  bytes_accessed = (
-      (lhs_bytes * tiles_n) + (rhs_bytes * tiles_k) + out_bytes
-  )
-  flops = 2 * m * k * n
-  cost_estimate = pl.CostEstimate(
-      flops=flops, bytes_accessed=bytes_accessed, transcendentals=0
-  )
   lhs = lhs.swapaxes(0, 1)
+
   call_gmm = pl.pallas_call(
       kernel,
-      out_shape=jax.ShapeDtypeStruct(
-          (num_actual_groups, k, n), preferred_element_type
-      ),
-      grid_spec=plgpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=2,
-          in_specs=[
-              lhs_block_spec,
-              rhs_block_spec,
-              in_out_block_spec,
-          ],
-          out_specs=out_block_spec,
-          grid=(tiles_n, tiles_k, num_active_tiles),
-          scratch_shapes=[plgpu.VMEM((tk, tn), jnp.float32)],
-      ),
+      out_shape=jax.ShapeDtypeStruct((num_actual_groups, k, n), preferred_element_type ),
+      grid=(tiles_n, tiles_k),
       input_output_aliases=input_output_aliases,
-      compiler_params=plgpu.CompilerParams(
-              dimension_semantics=("parallel", "arbitrary", "arbitrary")),
       interpret=interpret,
-      cost_estimate=cost_estimate,
   )
 
   out = call_gmm(
@@ -588,5 +776,3 @@ def tgmm(
       existing_out,
   )
   return out
-
-'''

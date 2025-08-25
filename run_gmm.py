@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 
 #from jax.jax.experimental.pallas.ops.gpu.megablox import gmm import gmm
-from megablox_new.gmm import gmm
+from megablox.gmm import gmm
 import sys
 
 INTERPRET=False

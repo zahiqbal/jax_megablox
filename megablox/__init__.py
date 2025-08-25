@@ -12,5 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#from jax.experimental.pallas.ops.gpu.megablox.ops import gmm as gmm
 from megablox.ops import gmm as gmm

@@ -1,9 +1,8 @@
 import jax
 import jax.numpy as jnp
 
-#from jax.jax.experimental.pallas.ops.gpu.megablox import gmm import gmm
-from megablox_new.gmm import gmm
-from megablox_new.gmm import tgmm
+
+from megablox.gmm import tgmm 
 import sys
 
 INTERPRET=False
@@ -24,22 +23,6 @@ def verify(mat1, mat2, message="", atol=5e-1):
         print(f"\n\tTest Passed:  mat1 and mat2 result matched...\n")
 
 
-def check_gmm_vs_ragged_dot(lhs, rhs, group_sizes, tiling, atol=5e-1):
-    out_gmm = gmm(lhs, rhs, group_sizes=group_sizes, tiling=tiling, interpret=INTERPRET)
-       
-    out_ragged = jax.lax.ragged_dot(lhs, rhs, group_sizes=group_sizes)
-    
-    if not jnp.allclose(out_gmm, out_ragged, atol=atol):
-        diff = jnp.abs(out_gmm - out_ragged).max()
-        raise ValueError(
-            f"\n\tMismatch between gmm and ragged_dot. Max diff={diff}"
-            f" \n\tmegablox out shape = {out_gmm.shape}\n\t out_ragged shape  = {out_ragged.shape}\n"
-            f"out_gmm = {out_gmm}\n\nout_ragged = {out_ragged} "
-        )
-    else:
-        print(f"\n\tTest Passed:  gmm and ragged_dot result matched...\n")
-
-    
 def test_gpu_megablox():
 
     key = jax.random.PRNGKey(0)
@@ -52,7 +35,7 @@ def test_gpu_megablox():
     rhs = jnp.full((M, N), 2.0, dtype=jnp.float32)
     tiling = (16, 16, 16)
     #out_gmm = gmm(lhs, rhs, group_sizes=group_sizes, tiling=tiling, interpret=INTERPRET)
-    out_tgmm = tgmm(lhs, rhs, group_sizes=group_sizes, tiling=tiling, interpret=INTERPRET)
+    out_tgmm = tgmm(lhs, rhs, group_sizes=group_sizes, preferred_element_type=lhs.dtype, tiling=tiling, interpret=INTERPRET)
     print(f"\n out_tgmm shape = {out_tgmm.shape}\n\t out_tgmm = {out_tgmm} ")
 
     print(f"\n\n\tlhs@rhs = {lhs@rhs} ")

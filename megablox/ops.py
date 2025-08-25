@@ -15,7 +15,6 @@
 """Grouped matrix multiplication operations with custom VJPs."""
 
 import jax
-#from jax.experimental.pallas.ops.gpu.megablox import gmm as backend
 from megablox import gmm as backend
 import jax.numpy as jnp
 
